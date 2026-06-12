@@ -18,7 +18,63 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import re
+
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    compare_price,
+    get_trends,
+)
+from style_memory import load_style_profile, update_profile_with_item
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract a description, optional size, and optional max_price from a natural
+    language query using regex. Free/offline/deterministic — no LLM needed.
+
+    "vintage graphic tee under $30, size M"
+        → {"description": "vintage graphic tee", "size": "M", "max_price": 30.0}
+    """
+    text = query.strip()
+
+    # max_price: "under $30", "below 30", "max $25", or a bare "$30".
+    max_price = None
+    m = re.search(r"(?:under|below|less than|max|<)\s*\$?\s*(\d+(?:\.\d+)?)", text, re.I)
+    if not m:
+        m = re.search(r"\$\s*(\d+(?:\.\d+)?)", text)
+    if m:
+        max_price = float(m.group(1))
+
+    # size: "size M", "size 8", "in size L".
+    size = None
+    sm = re.search(r"size\s+([A-Za-z0-9.]+)", text, re.I)
+    if sm:
+        size = sm.group(1).upper()
+
+    # description: the query with size/price phrases stripped, then filler words
+    # removed. Filler matters here because search does substring matching —
+    # short words like "in"/"a" would match inside "vintage"/"denim" and add noise.
+    description = re.sub(r"\bsize\s+[A-Za-z0-9.]+", "", text, flags=re.I)
+    description = re.sub(
+        r"(?:under|below|less than|max|<)\s*\$?\s*\d+(?:\.\d+)?", "", description, flags=re.I
+    )
+    description = re.sub(r"\$\s*\d+(?:\.\d+)?", "", description)
+
+    _STOPWORDS = {
+        "looking", "for", "a", "an", "the", "in", "on", "im", "i", "want",
+        "wanna", "need", "find", "me", "my", "some", "of", "to", "with",
+        "that", "what", "out", "there", "and", "how", "would", "style", "it",
+        "is", "are", "something",
+    }
+    words = [w for w in description.lower().split() if w not in _STOPWORDS]
+    description = " ".join(words).strip(" ,.")
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -42,6 +98,10 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+        # stretch features:
+        "retry_note": None,          # set if search was auto-loosened to find results
+        "price_assessment": None,    # dict from compare_price for the selected item
+        "trends_used": [],           # trending tags fed into the outfit suggestion
     }
 
 
@@ -92,9 +152,84 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: fresh session — the single source of truth for this interaction.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the natural-language query into structured params.
+    session["parsed"] = _parse_query(query)
+    parsed = session["parsed"]
+
+    # Step 3: search. DECISION POINT — branch on whether anything came back.
+    session["search_results"] = search_listings(
+        parsed["description"], parsed["size"], parsed["max_price"]
+    )
+
+    # Stretch (+1): RETRY WITH FALLBACK. If nothing matched, loosen the
+    # constraints one at a time (size first, then price) and record what changed,
+    # instead of giving up immediately.
+    if not session["search_results"] and parsed["size"] is not None:
+        retried = search_listings(parsed["description"], None, parsed["max_price"])
+        if retried:
+            session["search_results"] = retried
+            session["retry_note"] = (
+                f"No matches in size {parsed['size']}, so I dropped the size "
+                "filter and searched all sizes."
+            )
+    if not session["search_results"] and parsed["max_price"] is not None:
+        retried = search_listings(parsed["description"], None, None)
+        if retried:
+            session["search_results"] = retried
+            session["retry_note"] = (
+                f"Nothing under ${parsed['max_price']:.0f}, so I dropped the price "
+                "and size filters to show the closest matches."
+            )
+
+    if not session["search_results"]:
+        # No-results branch (even after retry): specific, actionable error. STOP.
+        # We do NOT call suggest_outfit / create_fit_card with empty input.
+        relaxers = []
+        if parsed["max_price"] is not None:
+            relaxers.append("raising your price limit")
+        if parsed["size"] is not None:
+            relaxers.append("dropping the size filter")
+        relaxers.append("trying different keywords")
+        session["error"] = (
+            f"No listings matched '{parsed['description']}'"
+            + (f" under ${parsed['max_price']:.0f}" if parsed["max_price"] else "")
+            + (f" in size {parsed['size']}" if parsed["size"] else "")
+            + ". Try " + ", or ".join(relaxers) + "."
+        )
+        return session  # early return — fit_card stays None
+
+    # Step 4: select the top-ranked item (the state hand-off).
+    session["selected_item"] = session["search_results"][0]
+
+    # Stretch (+2): PRICE COMPARISON. Judge the selected item's price vs comparable
+    # listings in the dataset.
+    session["price_assessment"] = compare_price(session["selected_item"])
+
+    # Stretch (+2): STYLE PROFILE MEMORY + TREND AWARENESS. Load remembered prefs
+    # (from prior sessions, no re-entry) and current trends, fold the selected
+    # item into the saved profile, and feed both into the outfit suggestion.
+    style_profile = load_style_profile()
+    session["trends_used"] = get_trends(parsed["size"])
+    update_profile_with_item(session["selected_item"])
+
+    # Step 5: suggest an outfit using the selected item + the wardrobe,
+    # biased by remembered style preferences and current trends.
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"],
+        session["wardrobe"],
+        style_profile=style_profile,
+        trends=session["trends_used"],
+    )
+
+    # Step 6: turn that outfit into a shareable fit card.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: done — error stays None on the happy path.
     return session
 
 

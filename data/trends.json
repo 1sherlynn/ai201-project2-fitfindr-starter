@@ -1,0 +1,14 @@
+{
+  "_source": "Mock 'recent popular tags' feed standing in for a public fashion platform's trending section (e.g. Depop/Pinterest trend tags). Hand-curated for this project — no external API.",
+  "updated": "2026-06",
+  "trending": [
+    { "tag": "balletcore", "size": "all" },
+    { "tag": "baggy denim", "size": "all" },
+    { "tag": "chunky loafers", "size": "all" },
+    { "tag": "y2k", "size": "all" },
+    { "tag": "oversized blazers", "size": "all" },
+    { "tag": "sheer layering", "size": "all" },
+    { "tag": "grunge revival", "size": "M" },
+    { "tag": "cargo everything", "size": "L" }
+  ]
+}

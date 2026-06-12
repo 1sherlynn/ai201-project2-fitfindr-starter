@@ -43,8 +43,44 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    # 1. Guard against an empty query.
+    if not user_query or not user_query.strip():
+        return "Please describe what you're looking for first. 🔍", "", ""
+
+    # 2. Pick the wardrobe based on the radio choice.
+    if wardrobe_choice == "Empty wardrobe (new user)":
+        wardrobe = get_empty_wardrobe()
+    else:
+        wardrobe = get_example_wardrobe()
+
+    # 3. Run the agent.
+    session = run_agent(user_query, wardrobe)
+
+    # 4. Error branch — show the message in panel 1, leave the others empty.
+    if session["error"]:
+        return f"⚠️ {session['error']}", "", ""
+
+    # 5. Happy path — format the selected listing for panel 1.
+    item = session["selected_item"]
+    brand = f"{item['brand']} · " if item.get("brand") else ""
+
+    parts = []
+    # Stretch: if the search was auto-loosened, tell the user what changed.
+    if session.get("retry_note"):
+        parts.append(f"🔁 {session['retry_note']}\n")
+    parts.append(
+        f"🛍️ {item['title']}\n"
+        f"${item['price']:.0f} · {item['platform']}\n"
+        f"{brand}{item['condition']} condition · size {item['size']}\n"
+        f"Style: {', '.join(item['style_tags'])}"
+    )
+    # Stretch: show the price-fairness assessment with its reasoning.
+    if session.get("price_assessment"):
+        parts.append(f"\n💰 Price check: {session['price_assessment']['reasoning']}")
+    parts.append(f"\n{item['description']}")
+
+    listing_text = "\n".join(parts)
+    return listing_text, session["outfit_suggestion"], session["fit_card"]
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
